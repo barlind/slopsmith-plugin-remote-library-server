@@ -1,0 +1,20 @@
+{
+  "id": "remote_library_server",
+  "name": "Remote Library Server",
+  "version": "0.2.0",
+  "private": false,
+  "nav": { "label": "Remote Server", "screen": "remote-library-server" },
+  "screen": "screen.html",
+  "settings": { "html": "settings.html" },
+  "script": "screen.js",
+  "routes": "routes.py",
+  "standards": ["plugin-runtime-idempotent.v1"],
+  "capabilities": {
+    "remote-library-server": {
+      "roles": ["source"],
+      "commands": ["start", "stop", "list-songs", "serve-art", "download-package"],
+      "events": ["remote-library-server.activity"],
+      "mode": "optional"
+    }
+  }
+}
