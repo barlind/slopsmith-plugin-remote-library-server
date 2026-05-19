@@ -3,11 +3,15 @@
         installed: false,
         settings: {},
         status: null,
-        songs: [],
-        activity: [],
-        searchTimer: null,
+        defaults: {},
+        loading: false,
+        busyAction: '',
+        lastError: '',
     };
     window.__remoteLibraryServerPlugin = state;
+    if (typeof state.loading !== 'boolean') state.loading = false;
+    if (typeof state.busyAction !== 'string') state.busyAction = '';
+    if (typeof state.lastError !== 'string') state.lastError = '';
 
     function esc(value) {
         return String(value == null ? '' : value)
@@ -18,26 +22,26 @@
             .replace(/'/g, '&#039;');
     }
 
-    function formatBytes(bytes) {
-        const value = Number(bytes || 0);
-        if (!value) return '';
-        if (value >= 1024 * 1024 * 1024) return `${(value / 1024 / 1024 / 1024).toFixed(1)} GB`;
-        if (value >= 1024 * 1024) return `${Math.round(value / 1024 / 1024)} MB`;
-        if (value >= 1024) return `${Math.round(value / 1024)} KB`;
-        return `${value} B`;
-    }
-
-    function toneClass(value) {
-        if (value === 'running' || value === true || value === 'started') return 'text-green-300 border-green-500/30 bg-green-500/10';
-        if (value === 'failed' || value === false) return 'text-red-300 border-red-500/30 bg-red-500/10';
-        return 'text-gray-300 border-gray-800 bg-dark-800';
-    }
-
     function setMessage(message, tone) {
         const node = document.getElementById('remote-library-server-message');
         if (!node) return;
         node.textContent = message || '';
         node.className = `mt-3 text-sm ${tone === 'error' ? 'text-red-300' : tone === 'success' ? 'text-green-300' : 'text-gray-400'}`;
+    }
+
+    function setBusyState(next = {}) {
+        if (typeof next.loading === 'boolean') state.loading = next.loading;
+        if (typeof next.busyAction === 'string') state.busyAction = next.busyAction;
+        syncActionButtons();
+    }
+
+    function syncActionButtons() {
+        const busy = state.loading || !!state.busyAction;
+        document.querySelectorAll('[data-rls-refresh],[data-rls-save],[data-rls-start],[data-rls-stop]').forEach(button => {
+            button.disabled = busy;
+            button.classList.toggle('opacity-60', busy);
+            button.classList.toggle('cursor-not-allowed', busy);
+        });
     }
 
     async function api(path, options) {
@@ -50,131 +54,156 @@
         return data;
     }
 
-    function statusCard(label, value, detail, tone) {
-        return `
-            <div class="rounded-lg border px-3 py-3 ${toneClass(tone)}">
-                <div class="text-xs uppercase text-gray-500">${esc(label)}</div>
-                <div class="mt-1 truncate text-sm font-semibold text-white">${esc(value || 'Unknown')}</div>
-                <div class="mt-1 truncate text-xs text-gray-400">${esc(detail || '')}</div>
-            </div>
-        `;
+    function defaultValue(key) {
+        const fallback = { host: '127.0.0.1', port: 8765, sourceName: '' };
+        return state.defaults[key] || fallback[key] || '';
     }
 
     function setForm(settings) {
         const values = {
             'rls-enabled': Boolean(settings.enabled),
-            'rls-host': settings.host || '127.0.0.1',
-            'rls-port': settings.port || 8765,
             'rls-source-name': settings.sourceName || '',
-            'rls-public-url': settings.publicUrl || '',
+            'rls-host': settings.host || '',
+            'rls-port': settings.port || '',
+        };
+        const placeholders = {
+            'rls-source-name': defaultValue('sourceName'),
+            'rls-host': defaultValue('host'),
+            'rls-port': defaultValue('port'),
         };
         for (const [id, value] of Object.entries(values)) {
             const input = document.getElementById(id);
             if (!input) continue;
             if (input.type === 'checkbox') input.checked = Boolean(value);
             else input.value = value;
+            if (placeholders[id]) input.placeholder = String(placeholders[id]);
         }
     }
 
     function readForm() {
         return {
             enabled: Boolean(document.getElementById('rls-enabled')?.checked),
-            host: document.getElementById('rls-host')?.value.trim() || '127.0.0.1',
-            port: Number(document.getElementById('rls-port')?.value || 8765),
-            sourceName: document.getElementById('rls-source-name')?.value.trim() || '',
-            publicUrl: document.getElementById('rls-public-url')?.value.trim() || '',
+            sourceName: document.getElementById('rls-source-name')?.value.trim() || defaultValue('sourceName'),
+            host: document.getElementById('rls-host')?.value.trim() || defaultValue('host'),
+            port: Number(document.getElementById('rls-port')?.value || defaultValue('port')),
         };
+    }
+
+    function powerIcon() {
+        return '<svg class="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v9m6.36-6.36a9 9 0 1 1-12.72 0"/></svg>';
     }
 
     function renderStatus() {
         const status = state.status || {};
-        const source = status.source || {};
         const server = status.server || {};
-        const subtitle = document.getElementById('remote-library-server-subtitle');
-        if (subtitle) {
-            subtitle.textContent = `${source.sourceName || 'Local source'} | ${source.songCount || 0} songs`;
-        }
+        const source = status.source || {};
+        const scan = status.scan || {};
+        const running = Boolean(server.running);
+        const waiting = Boolean(server.waitingForScan);
         const node = document.getElementById('remote-library-server-status');
-        if (node) {
-            node.innerHTML = [
-                statusCard('Server', server.running ? 'Running' : 'Stopped', `${server.host || ''}:${server.port || ''}`, server.running),
-                statusCard('Local URL', server.url || '', server.protocol || '', server.running ? 'running' : 'stopped'),
-                statusCard('Source', source.sourceId || '', `${source.songCount || 0} songs`, source.libraryRootConfigured),
-            ].join('');
-        }
-    }
+        const subtitle = document.getElementById('remote-library-server-subtitle');
+        const stateLabel = state.loading && !state.status ? 'Loading...' : waiting ? 'Waiting for library scan' : running ? 'Running' : 'Stopped';
+        const detail = waiting
+            ? `Scan ${scan.stage || 'starting'}${scan.total ? ` ${scan.done || 0}/${scan.total}` : ''}`
+            : running
+                ? server.url || ''
+                : 'Direct server is not listening';
 
-    function renderSongs() {
-        const node = document.getElementById('remote-library-server-songs');
-        if (!node) return;
-        if (!state.songs.length) {
-            node.innerHTML = '<div class="rounded-lg border border-gray-800 bg-dark-800 px-3 py-3 text-sm text-gray-400">No songs found.</div>';
-            return;
+        if (subtitle) {
+            subtitle.textContent = state.lastError && !state.status
+                ? 'Server status unavailable'
+                : `${source.sourceName || defaultValue('sourceName') || 'Remote Library'} | ${source.songCount || 0} songs`;
         }
-        node.innerHTML = state.songs.slice(0, 50).map(song => `
-            <div class="rounded-lg border border-gray-800 bg-dark-800 px-3 py-3">
-                <div class="truncate text-sm font-semibold text-white">${esc(song.title || 'Untitled')}</div>
-                <div class="truncate text-xs text-gray-500">${esc(song.artist || 'Unknown artist')}${song.sizeBytes ? ` | ${esc(formatBytes(song.sizeBytes))}` : ''}</div>
-            </div>
-        `).join('');
-    }
-
-    function renderActivity() {
-        const node = document.getElementById('remote-library-server-activity');
         if (!node) return;
-        if (!state.activity.length) {
-            node.innerHTML = '<div class="rounded-lg border border-gray-800 bg-dark-800 px-3 py-3 text-sm text-gray-400">No activity yet.</div>';
-            return;
-        }
-        node.innerHTML = state.activity.slice(0, 20).map(item => `
-            <div class="rounded-lg border border-gray-800 bg-dark-800 px-3 py-3">
-                <div class="flex items-center justify-between gap-3">
-                    <div class="min-w-0 truncate text-sm text-gray-200">${esc(item.message || item.eventType)}</div>
-                    <span class="rounded-full border px-2 py-1 text-xs ${toneClass(item.outcome)}">${esc(item.outcome || 'event')}</span>
+        if (state.lastError && !state.status) {
+            node.innerHTML = `
+                <div class="rounded-lg border border-red-500/30 bg-red-500/10 p-4">
+                    <div class="text-xs uppercase text-red-200">Server</div>
+                    <div class="mt-1 text-lg font-semibold text-white">Unavailable</div>
+                    <div class="mt-1 text-sm text-red-200">${esc(state.lastError)}</div>
                 </div>
-                <div class="mt-1 text-xs text-gray-500">${esc(item.createdAt || '')}</div>
+            `;
+            return;
+        }
+        const panelClass = running
+            ? 'border-green-500/30 bg-green-500/10'
+            : waiting
+                ? 'border-amber-500/30 bg-amber-500/10'
+                : 'border-red-500/30 bg-red-500/10';
+        const buttonAction = running ? 'stop' : 'start';
+        const buttonClass = running
+            ? 'bg-red-500/20 text-red-100 hover:bg-red-500/30'
+            : 'bg-green-500/20 text-green-100 hover:bg-green-500/30';
+        node.innerHTML = `
+            <div class="rounded-lg border ${panelClass} p-4">
+                <div class="flex items-center justify-between gap-4">
+                    <div class="min-w-0">
+                        <div class="text-xs uppercase text-gray-400">Server</div>
+                        <div class="mt-1 text-2xl font-semibold text-white">${esc(stateLabel)}</div>
+                        <div class="mt-1 truncate text-sm text-gray-300">${esc(detail)}</div>
+                    </div>
+                    <button class="flex h-11 w-11 flex-shrink-0 items-center justify-center rounded-full ${buttonClass} transition" data-rls-${buttonAction} aria-label="${running ? 'Stop server' : 'Start server'}" title="${running ? 'Stop server' : 'Start server'}">
+                        ${powerIcon()}
+                    </button>
+                </div>
             </div>
-        `).join('');
-    }
-
-    function renderAll() {
-        renderStatus();
-        renderSongs();
-        renderActivity();
+        `;
+        syncActionButtons();
     }
 
     async function refresh() {
-        const query = encodeURIComponent(document.getElementById('rls-search')?.value || '');
-        const [settings, status, songs, activity] = await Promise.all([
-            api('/settings'),
-            api('/status'),
-            api(`/local-songs?q=${query}&pageSize=50`),
-            api('/activity'),
-        ]);
-        state.settings = settings;
-        state.status = status;
-        state.songs = songs.songs || [];
-        state.activity = activity.events || [];
-        setForm(settings);
-        renderAll();
+        state.lastError = '';
+        setBusyState({ loading: true, busyAction: 'refresh' });
+        renderStatus();
+        try {
+            const [settings, status] = await Promise.all([
+                api('/settings'),
+                api('/status'),
+            ]);
+            state.settings = settings;
+            state.status = status;
+            state.defaults = status.defaults || state.defaults || {};
+            setForm(settings);
+        } catch (error) {
+            state.lastError = error.message || 'Refresh failed.';
+            throw error;
+        } finally {
+            setBusyState({ loading: false, busyAction: '' });
+            renderStatus();
+        }
     }
 
     async function save() {
-        state.settings = await api('/settings', { method: 'POST', body: JSON.stringify(readForm()) });
-        setMessage('Settings saved.', 'success');
-        await refresh();
+        setBusyState({ busyAction: 'save' });
+        try {
+            await api('/settings', { method: 'POST', body: JSON.stringify(readForm()) });
+            setMessage('Settings saved.', 'success');
+            await refresh();
+        } finally {
+            setBusyState({ busyAction: '' });
+        }
     }
 
     async function start() {
-        await api('/start', { method: 'POST', body: JSON.stringify({}) });
-        setMessage('Server started.', 'success');
-        await refresh();
+        setBusyState({ busyAction: 'start' });
+        try {
+            await api('/start', { method: 'POST', body: JSON.stringify({}) });
+            setMessage('Server started.', 'success');
+            await refresh();
+        } finally {
+            setBusyState({ busyAction: '' });
+        }
     }
 
     async function stop() {
-        await api('/stop', { method: 'POST', body: JSON.stringify({}) });
-        setMessage('Server stopped.', 'success');
-        await refresh();
+        setBusyState({ busyAction: 'stop' });
+        try {
+            await api('/stop', { method: 'POST', body: JSON.stringify({}) });
+            setMessage('Server stopped.', 'success');
+            await refresh();
+        } finally {
+            setBusyState({ busyAction: '' });
+        }
     }
 
     function installHandlers() {
@@ -182,7 +211,7 @@
         state.installed = true;
         document.addEventListener('click', async event => {
             const target = event.target.closest('[data-rls-refresh],[data-rls-save],[data-rls-start],[data-rls-stop],[data-rls-open-screen]');
-            if (!target) return;
+            if (!target || target.disabled) return;
             try {
                 if (target.matches('[data-rls-refresh]')) await refresh();
                 if (target.matches('[data-rls-save]')) await save();
@@ -193,18 +222,13 @@
                 setMessage(error.message || 'Action failed.', 'error');
             }
         });
-        document.addEventListener('input', event => {
-            if (!event.target.matches('#rls-search')) return;
-            window.clearTimeout(state.searchTimer);
-            state.searchTimer = window.setTimeout(() => {
-                refresh().catch(error => setMessage(error.message || 'Search failed.', 'error'));
-            }, 200);
-        });
     }
 
     function init() {
         installHandlers();
         if (document.getElementById('remote-library-server-root')) {
+            setBusyState({ loading: true });
+            renderStatus();
             refresh().catch(error => setMessage(error.message || 'Refresh failed.', 'error'));
         }
     }

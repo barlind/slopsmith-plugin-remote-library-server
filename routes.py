@@ -1,18 +1,18 @@
 from __future__ import annotations
 
-import io
+import base64
+import inspect
 import os
 import re
-import shutil
 import socket
-import tempfile
 import threading
-import zipfile
+import time
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, RedirectResponse, Response
 
 from remote_library_server.crypto import sha256_hex
 from remote_library_server.models import PackageForm, RemoteSongStatus, RemoteSongSummary, SyncSupport
@@ -20,10 +20,11 @@ from remote_library_server.store import RemoteLibraryServerStore
 
 _store: RemoteLibraryServerStore | None = None
 _get_dlc_dir = None
-_extract_meta = None
-_meta_db = None
+_library_providers = None
 _direct_server = None
 _direct_thread: threading.Thread | None = None
+_autostart_thread: threading.Thread | None = None
+_get_scan_status = None
 
 
 def _settings() -> dict:
@@ -36,7 +37,11 @@ def _source_id() -> str:
 
 
 def _source_name() -> str:
-    return _settings().get("sourceName") or f"Remote Library on {socket.gethostname()}"
+    return str(_settings().get("sourceName") or _default_source_name())
+
+
+def _default_source_name() -> str:
+    return f"Remote Library on {socket.gethostname()}"
 
 
 def _bind_host() -> str:
@@ -59,8 +64,37 @@ def _direct_url() -> str:
     return f"http://{_display_host()}:{_bind_port()}"
 
 
-def _public_url() -> str:
-    return str(_settings().get("publicUrl") or "").rstrip("/")
+def _normalize_settings(data: dict) -> dict:
+    current = _settings()
+    incoming = dict(data or {})
+    normalized = {
+        "enabled": bool(incoming.get("enabled", current.get("enabled"))),
+        "host": str(incoming.get("host", current.get("host")) or "127.0.0.1").strip() or "127.0.0.1",
+        "sourceName": (
+            str(incoming.get("sourceName", current.get("sourceName")) or _default_source_name()).strip()
+            or _default_source_name()
+        ),
+    }
+    try:
+        normalized["port"] = max(1, min(65535, int(incoming.get("port", current.get("port")) or 8765)))
+    except (TypeError, ValueError):
+        normalized["port"] = 8765
+    return normalized
+
+
+def _scan_status() -> dict:
+    if callable(_get_scan_status):
+        try:
+            status = _get_scan_status()
+            return status if isinstance(status, dict) else {}
+        except Exception:
+            return {}
+    return {"running": False, "stage": "complete"}
+
+
+def _scan_ready() -> bool:
+    status = _scan_status()
+    return not bool(status.get("running")) and status.get("stage") == "complete"
 
 
 def _local_library_root() -> Path | None:
@@ -76,31 +110,173 @@ def _local_library_root() -> Path | None:
     return path if path.exists() else None
 
 
-def _package_form_for_path(path: Path) -> PackageForm:
-    suffix = path.suffix.lower()
-    if path.is_dir() and path.name.lower().endswith(".sloppak"):
-        return PackageForm.SLOPPAK_DIRECTORY
-    if suffix == ".psarc":
+def _local_provider():
+    if _library_providers is None:
+        return None
+    try:
+        return _library_providers.get("local") if hasattr(_library_providers, "get") else None
+    except Exception:
+        return None
+
+
+def _local_provider_method(method_name: str):
+    provider = _local_provider()
+    if provider is None:
+        return None
+    if hasattr(_library_providers, "provider_method"):
+        try:
+            method = _library_providers.provider_method(provider, method_name)
+            if callable(method):
+                return method
+        except Exception:
+            pass
+    method = getattr(provider, method_name, None)
+    return method if callable(method) else None
+
+
+def _call_local_provider(method_name: str, **kwargs):
+    method = _local_provider_method(method_name)
+    if not callable(method):
+        raise HTTPException(status_code=503, detail="Local library provider is unavailable")
+    return method(**kwargs)
+
+
+async def _call_local_provider_async(method_name: str, **kwargs):
+    result = _call_local_provider(method_name, **kwargs)
+    if inspect.isawaitable(result):
+        result = await result
+    return result
+
+
+def _remote_song_id_for_relative(relative_name: str) -> str:
+    encoded = base64.urlsafe_b64encode(relative_name.encode("utf-8")).decode("ascii").rstrip("=")
+    return f"song_{encoded}"
+
+
+def _relative_for_remote_song_id(song_id: str) -> str | None:
+    raw = str(song_id or "")
+    if not raw.startswith("song_"):
+        return None
+    encoded = raw[5:]
+    try:
+        padding = "=" * (-len(encoded) % 4)
+        relative_name = base64.urlsafe_b64decode((encoded + padding).encode("ascii")).decode("utf-8")
+    except Exception:
+        return None
+    path = Path(relative_name)
+    if not relative_name or path.is_absolute() or ".." in path.parts:
+        return None
+    return path.as_posix()
+
+
+def _package_path_for_relative(relative_name: str) -> Path | None:
+    root = _local_library_root()
+    if not root:
+        return None
+    try:
+        package_path = (root / relative_name).resolve()
+        package_path.relative_to(root.resolve())
+    except (OSError, ValueError):
+        return None
+    return package_path if package_path.exists() and package_path.is_file() else None
+
+
+def _csv_values(value: str | None) -> list[str]:
+    return [part.strip() for part in str(value or "").split(",") if part.strip()]
+
+
+def _parse_has_lyrics(value: str | None) -> int | None:
+    if value in (None, ""):
+        return None
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "with", "lyrics"}:
+        return 1
+    if normalized in {"0", "false", "no", "without", "none"}:
+        return 0
+    return None
+
+
+def _query_filters(
+    *,
+    q: str = "",
+    format_filter: str = "",
+    arrangements_has: str = "",
+    arrangements_lacks: str = "",
+    stems_has: str = "",
+    stems_lacks: str = "",
+    has_lyrics: str = "",
+    tunings: str = "",
+) -> dict:
+    return {
+        "q": q,
+        "format_filter": format_filter,
+        "arrangements_has": _csv_values(arrangements_has),
+        "arrangements_lacks": _csv_values(arrangements_lacks),
+        "stems_has": _csv_values(stems_has),
+        "stems_lacks": _csv_values(stems_lacks),
+        "has_lyrics": _parse_has_lyrics(has_lyrics),
+        "tunings": _csv_values(tunings),
+    }
+
+
+def _package_form_for_song(song: dict) -> PackageForm:
+    relative_name = str(song.get("filename") or "")
+    fmt = str(song.get("format") or "").lower()
+    suffix = Path(relative_name).suffix.lower()
+    if fmt == "psarc" or suffix == ".psarc":
         return PackageForm.PSARC_FILE
-    if suffix in {".sloppak", ".zip"}:
+    if fmt == "sloppak" or suffix in {".sloppak", ".zip"}:
         return PackageForm.SLOPPAK_ZIP
     return PackageForm.UNSUPPORTED
 
 
-def _iter_package_paths(root: Path) -> list[Path]:
-    candidates: list[Path] = []
-    for path in root.rglob("*"):
-        if _package_form_for_path(path) != PackageForm.UNSUPPORTED:
-            candidates.append(path)
-    return sorted(candidates, key=lambda item: item.relative_to(root).as_posix().lower())
+def _remote_summary_from_local_song(song: dict) -> dict:
+    relative_name = str(song.get("filename") or "")
+    if not relative_name:
+        raise ValueError("local library song is missing filename")
+    package_form = _package_form_for_song(song)
+    syncable = package_form in {PackageForm.PSARC_FILE, PackageForm.SLOPPAK_ZIP}
+    remote_song_id = _remote_song_id_for_relative(relative_name)
+    identity = f"{_source_id()}:{relative_name}".encode("utf-8")
+    summary = RemoteSongSummary(
+        source_id=_source_id(),
+        remote_song_id=remote_song_id,
+        title=song.get("title") or Path(relative_name).stem,
+        artist=song.get("artist") or "",
+        album=song.get("album") or "",
+        year=_coerce_int(song.get("year")),
+        duration=_coerce_float(song.get("duration")),
+        format=song.get("format") or ("psarc" if package_form == PackageForm.PSARC_FILE else "sloppak"),
+        package_form=package_form,
+        manifest_hash=sha256_hex(identity),
+        package_hash="",
+        size_bytes=_coerce_int(song.get("sizeBytes") or song.get("size") or song.get("size_bytes")) or 0,
+        artwork_thumb_hash=sha256_hex(f"art:{_source_id()}:{relative_name}".encode("utf-8")),
+        arrangements=list(song.get("arrangements") or []),
+        has_lyrics=bool(song.get("has_lyrics", song.get("hasLyrics", False))),
+        stem_count=_coerce_int(song.get("stem_count", song.get("stemCount"))) or 0,
+        stem_ids=list(song.get("stem_ids") or song.get("stemIds") or []),
+        tuning=song.get("tuning") or song.get("tuning_name") or song.get("tuningName") or "",
+        capabilities=["artwork", "package-download"] if syncable else ["artwork"],
+        sync_support=SyncSupport.SYNCABLE if syncable else SyncSupport.NOT_SYNCABLE,
+        status=RemoteSongStatus.REMOTE_ONLY if syncable else RemoteSongStatus.NOT_SYNCABLE,
+    ).to_dict()
+    summary.pop("packageHash", None)
+    summary["artworkUrl"] = f"/songs/{remote_song_id}/art"
+    if syncable:
+        summary["packageUrl"] = f"/songs/{remote_song_id}/package"
+    return summary
 
 
-def _sha256_file(path: Path) -> str:
-    digest = __import__("hashlib").sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return "sha256:" + digest.hexdigest()
+def _remote_artists_from_local_artists(artists: list[dict]) -> list[dict]:
+    remote_artists = []
+    for artist in artists:
+        albums = []
+        for album in artist.get("albums") or []:
+            songs = [_remote_summary_from_local_song(song) for song in album.get("songs") or []]
+            albums.append({**album, "songs": songs})
+        remote_artists.append({**artist, "albums": albums})
+    return remote_artists
 
 
 def _coerce_int(value) -> int | None:
@@ -117,176 +293,97 @@ def _coerce_float(value) -> float | None:
         return None
 
 
-def _metadata_for_package(package_path: Path) -> dict:
-    if not callable(_extract_meta) or not package_path.exists():
-        return {}
-    root = _local_library_root()
-    stat = package_path.stat()
+def _local_song_count() -> int:
+    stats = _call_local_provider("query_stats", **_query_filters())
     try:
-        cache_key = package_path.relative_to(root).as_posix() if root else package_path.name
-    except ValueError:
-        cache_key = package_path.name
-    if _meta_db is not None and hasattr(_meta_db, "get"):
-        try:
-            cached = _meta_db.get(cache_key, float(stat.st_mtime), int(stat.st_size))
-            if cached:
-                return cached
-        except Exception:
-            pass
-    try:
-        metadata = _extract_meta(package_path) or {}
-    except Exception:
-        return {}
-    if _meta_db is not None and hasattr(_meta_db, "put") and metadata.get("title"):
-        try:
-            _meta_db.put(cache_key, float(stat.st_mtime), int(stat.st_size), metadata)
-        except Exception:
-            pass
-    return metadata
+        return int((stats or {}).get("total_songs") or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
-def _song_summary(package_path: Path, root: Path) -> dict:
-    package_form = _package_form_for_path(package_path)
-    relative_name = package_path.relative_to(root).as_posix()
-    syncable = package_form in {PackageForm.PSARC_FILE, PackageForm.SLOPPAK_ZIP}
-    package_hash = _sha256_file(package_path) if syncable and package_path.is_file() else ""
-    identity = f"{_source_id()}:{relative_name}".encode("utf-8")
-    metadata = _metadata_for_package(package_path)
-    song_format = metadata.get("format") or (
-        "psarc" if package_form == PackageForm.PSARC_FILE
-        else "sloppak" if "sloppak" in package_form.value
-        else "unsupported"
-    )
-    remote_song_id = sha256_hex(identity).replace("sha256:", "song_", 1)
-    artwork_hash = (
-        sha256_hex(f"art:{_source_id()}:{relative_name}:{package_hash}".encode("utf-8"))
-        if syncable
-        else None
-    )
-    summary = RemoteSongSummary(
-        source_id=_source_id(),
-        remote_song_id=remote_song_id,
-        title=metadata.get("title") or package_path.stem,
-        artist=metadata.get("artist") or "",
-        album=metadata.get("album") or "",
-        year=_coerce_int(metadata.get("year")),
-        duration=_coerce_float(metadata.get("duration")),
-        format=song_format,
-        package_form=package_form,
-        manifest_hash=sha256_hex(identity),
-        package_hash=package_hash,
-        size_bytes=package_path.stat().st_size if package_path.is_file() else 0,
-        artwork_thumb_hash=artwork_hash,
-        arrangements=list(metadata.get("arrangements") or []),
-        has_lyrics=bool(metadata.get("has_lyrics", False)),
-        tuning=metadata.get("tuning") or metadata.get("tuning_name") or "",
-        capabilities=["artwork", "package-download"] if syncable else [],
-        sync_support=SyncSupport.SYNCABLE if syncable else SyncSupport.NOT_SYNCABLE,
-        status=RemoteSongStatus.REMOTE_ONLY if syncable else RemoteSongStatus.NOT_SYNCABLE,
-    ).to_dict()
-    summary["artworkUrl"] = f"/songs/{remote_song_id}/art"
-    if syncable:
-        summary["packageUrl"] = f"/songs/{remote_song_id}/package"
-    return summary
-
-
-def _local_song_summaries(limit: int = 5000) -> list[dict]:
-    root = _local_library_root()
-    if not root:
-        return []
-    songs = []
-    for package_path in _iter_package_paths(root):
-        if len(songs) >= limit:
-            break
-        songs.append(_song_summary(package_path, root))
-    return songs
-
-
-def _search_songs(query: str = "") -> list[dict]:
-    needle = (query or "").strip().lower()
-    songs = _local_song_summaries()
-    if not needle:
-        return songs
-    return [
-        song for song in songs
-        if needle in str(song.get("title", "")).lower()
-        or needle in str(song.get("artist", "")).lower()
-        or needle in str(song.get("album", "")).lower()
-    ]
-
-
-def _local_package_path(song_id: str, package_hash: str | None = None) -> Path | None:
-    root = _local_library_root()
-    if not root:
-        return None
-    for package_path in _iter_package_paths(root):
-        summary = _song_summary(package_path, root)
-        if summary["remoteSongId"] != song_id:
-            continue
-        if package_hash and summary.get("packageHash") != package_hash:
-            continue
-        return package_path
-    return None
-
-
-def _zip_artwork(package_path: Path) -> tuple[bytes, str] | None:
-    if not zipfile.is_zipfile(package_path):
-        return None
-    with zipfile.ZipFile(package_path) as archive:
-        for item in archive.namelist():
-            name = Path(item).name.lower()
-            if name in {"cover.jpg", "cover.jpeg", "cover.png", "cover.webp"}:
-                suffix = Path(name).suffix
-                media_type = {".png": "image/png", ".webp": "image/webp"}.get(suffix, "image/jpeg")
-                return archive.read(item), media_type
-    return None
-
-
-def _package_artwork(package_path: Path) -> tuple[bytes, str] | None:
-    if package_path.is_dir() and package_path.name.lower().endswith(".sloppak"):
-        for name in ("cover.jpg", "cover.jpeg", "cover.png", "cover.webp"):
-            cover = package_path / name
-            if cover.exists() and cover.is_file():
-                media_type = {".png": "image/png", ".webp": "image/webp"}.get(cover.suffix.lower(), "image/jpeg")
-                return cover.read_bytes(), media_type
-        return None
-    zipped = _zip_artwork(package_path)
-    if zipped:
-        return zipped
-    if package_path.suffix.lower() != ".psarc":
-        return None
-    tmp = tempfile.mkdtemp(prefix="remote_library_server_art_")
-    try:
-        from PIL import Image
-        from psarc import unpack_psarc
-
-        unpack_psarc(str(package_path), tmp)
-        dds_files = sorted(
-            Path(tmp).rglob("*.dds"), key=lambda item: item.stat().st_size, reverse=True
-        )
-        if not dds_files:
-            return None
-        image = Image.open(dds_files[0]).convert("RGB")
-        buffer = io.BytesIO()
-        image.save(buffer, "PNG")
-        return buffer.getvalue(), "image/png"
-    except Exception:
-        return None
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+def _library_art_response(result: Any) -> Response:
+    if result is None:
+        raise HTTPException(status_code=404, detail="artwork not found")
+    if isinstance(result, Response):
+        return result
+    if isinstance(result, (bytes, bytearray, memoryview)):
+        return Response(content=bytes(result), media_type="image/png")
+    if isinstance(result, (str, Path)):
+        return FileResponse(str(result))
+    if isinstance(result, dict):
+        url = result.get("url") or result.get("art_url") or result.get("artUrl")
+        if isinstance(url, str) and url:
+            return RedirectResponse(url)
+        path = result.get("path") or result.get("file")
+        if isinstance(path, (str, Path)):
+            return FileResponse(str(path), media_type=result.get("media_type") or result.get("content_type"))
+        content = result.get("content") or result.get("bytes")
+        if isinstance(content, (bytes, bytearray, memoryview)):
+            media_type = result.get("media_type") or result.get("content_type") or "image/png"
+            return Response(content=bytes(content), media_type=media_type)
+    raise HTTPException(status_code=500, detail="unsupported artwork response")
 
 
 def _source_payload() -> dict:
-    songs = _local_song_summaries()
     return {
         "ok": True,
         "sourceId": _source_id(),
         "sourceName": _source_name(),
-        "songCount": len(songs),
+        "songCount": _local_song_count(),
         "server": {
             "url": _direct_url(),
-            "publicUrl": _public_url(),
             "protocol": "slopsmith-direct-library.v1",
+        },
+    }
+
+
+def _query_page_payload(
+    *,
+    q: str = "",
+    page_size: int = 50,
+    cursor: str | None = None,
+    page: int = 0,
+    sort: str = "artist",
+    direction: str = "asc",
+    format_filter: str = "",
+    arrangements_has: str = "",
+    arrangements_lacks: str = "",
+    stems_has: str = "",
+    stems_lacks: str = "",
+    has_lyrics: str = "",
+    tunings: str = "",
+) -> dict:
+    offset = max(0, int(cursor or 0))
+    page_number = max(0, int(page or 0)) if not cursor else offset // page_size
+    songs, total = _call_local_provider(
+        "query_page",
+        page=page_number,
+        size=page_size,
+        sort=sort,
+        direction=direction,
+        **_query_filters(
+            q=q,
+            format_filter=format_filter,
+            arrangements_has=arrangements_has,
+            arrangements_lacks=arrangements_lacks,
+            stems_has=stems_has,
+            stems_lacks=stems_lacks,
+            has_lyrics=has_lyrics,
+            tunings=tunings,
+        ),
+    )
+    next_offset = offset + page_size
+    return {
+        "source": _source_payload(),
+        "songs": [_remote_summary_from_local_song(song) for song in songs],
+        "total": int(total or 0),
+        "nextCursor": str(next_offset) if next_offset < int(total or 0) else None,
+        "query": {
+            "page": page_number,
+            "pageSize": page_size,
+            "sort": sort,
+            "direction": direction,
+            "filtersApplied": True,
         },
     }
 
@@ -310,43 +407,124 @@ def _create_direct_app() -> FastAPI:
         return _source_payload()
 
     @direct_app.get("/songs")
-    def songs(q: str = "", pageSize: int = Query(50, ge=1, le=500), cursor: str | None = None) -> dict:
-        offset = max(0, int(cursor or 0))
-        matches = _search_songs(q)
-        page = matches[offset:offset + pageSize]
-        next_cursor = str(offset + pageSize) if offset + pageSize < len(matches) else None
+    def songs(
+        q: str = "",
+        pageSize: int = Query(50, ge=1, le=500),
+        cursor: str | None = None,
+        page: int = 0,
+        sort: str = "artist",
+        direction: str = "asc",
+        format: str = "",
+        arrangements_has: str = "",
+        arrangements_lacks: str = "",
+        stems_has: str = "",
+        stems_lacks: str = "",
+        has_lyrics: str = "",
+        tunings: str = "",
+    ) -> dict:
+        return _query_page_payload(
+            q=q,
+            page_size=pageSize,
+            cursor=cursor,
+            page=page,
+            sort=sort,
+            direction=direction,
+            format_filter=format,
+            arrangements_has=arrangements_has,
+            arrangements_lacks=arrangements_lacks,
+            stems_has=stems_has,
+            stems_lacks=stems_lacks,
+            has_lyrics=has_lyrics,
+            tunings=tunings,
+        )
+
+    @direct_app.get("/artists")
+    def artists(
+        letter: str = "",
+        q: str = "",
+        pageSize: int = Query(50, ge=1, le=100),
+        page: int = 0,
+        format: str = "",
+        arrangements_has: str = "",
+        arrangements_lacks: str = "",
+        stems_has: str = "",
+        stems_lacks: str = "",
+        has_lyrics: str = "",
+        tunings: str = "",
+    ) -> dict:
+        local_artists, total = _call_local_provider(
+            "query_artists",
+            letter=letter,
+            page=max(0, int(page or 0)),
+            size=pageSize,
+            **_query_filters(
+                q=q,
+                format_filter=format,
+                arrangements_has=arrangements_has,
+                arrangements_lacks=arrangements_lacks,
+                stems_has=stems_has,
+                stems_lacks=stems_lacks,
+                has_lyrics=has_lyrics,
+                tunings=tunings,
+            ),
+        )
         return {
-            "source": _source_payload(),
-            "songs": page,
-            "total": len(matches),
-            "nextCursor": next_cursor,
+            "artists": _remote_artists_from_local_artists(local_artists),
+            "total_artists": int(total or 0),
+            "query": {"page": page, "pageSize": pageSize, "filtersApplied": True},
         }
 
+    @direct_app.get("/stats")
+    def stats(
+        q: str = "",
+        format: str = "",
+        arrangements_has: str = "",
+        arrangements_lacks: str = "",
+        stems_has: str = "",
+        stems_lacks: str = "",
+        has_lyrics: str = "",
+        tunings: str = "",
+    ) -> dict:
+        result = _call_local_provider(
+            "query_stats",
+            **_query_filters(
+                q=q,
+                format_filter=format,
+                arrangements_has=arrangements_has,
+                arrangements_lacks=arrangements_lacks,
+                stems_has=stems_has,
+                stems_lacks=stems_lacks,
+                has_lyrics=has_lyrics,
+                tunings=tunings,
+            ),
+        )
+        return {**result, "query": {"filtersApplied": True}}
+
+    @direct_app.get("/tuning-names")
+    def tuning_names() -> dict:
+        return _call_local_provider("tuning_names")
+
     @direct_app.get("/songs/{song_id}/art")
-    def song_art(song_id: str) -> Response:
-        package_path = _local_package_path(song_id)
-        if not package_path:
+    async def song_art(song_id: str) -> Response:
+        relative_name = _relative_for_remote_song_id(song_id)
+        if not relative_name:
             raise HTTPException(status_code=404, detail="song not found")
-        artwork = _package_artwork(package_path)
-        if not artwork:
-            raise HTTPException(status_code=404, detail="artwork not found")
-        content, media_type = artwork
-        return Response(content=content, media_type=media_type, headers={"Cache-Control": "public, max-age=3600"})
+        result = await _call_local_provider_async("get_art", song_id=relative_name)
+        response = _library_art_response(result)
+        response.headers.setdefault("Cache-Control", "public, max-age=3600")
+        return response
 
     @direct_app.get("/songs/{song_id}/package")
-    def song_package(song_id: str, packageHash: str | None = None) -> FileResponse:
-        package_path = _local_package_path(song_id, packageHash)
-        if not package_path or not package_path.is_file():
+    def song_package(song_id: str) -> FileResponse:
+        relative_name = _relative_for_remote_song_id(song_id)
+        package_path = _package_path_for_relative(relative_name or "") if relative_name else None
+        if not package_path:
             raise HTTPException(status_code=404, detail="package not found")
-        summary = _song_summary(package_path, _local_library_root())
         return FileResponse(
             package_path,
             media_type="application/octet-stream",
             filename=package_path.name,
-            headers={
-                "X-Slopsmith-Remote-Song-Id": song_id,
-                "X-Slopsmith-Package-Hash": summary.get("packageHash") or "",
-            },
+            headers={"X-Slopsmith-Remote-Song-Id": song_id},
         )
 
     return direct_app
@@ -401,28 +579,56 @@ def _restart_direct_server() -> dict:
     return _start_direct_server()
 
 
+def _autostart_after_scan() -> None:
+    while _settings().get("enabled") and not _scan_ready():
+        time.sleep(1)
+    if not _settings().get("enabled") or _is_direct_server_running():
+        return
+    try:
+        _start_direct_server()
+    except ValueError as exc:
+        if _store:
+            _store.add_activity("direct-server", "failed", str(exc))
+
+
+def _schedule_autostart_after_scan() -> None:
+    global _autostart_thread
+    if not _settings().get("enabled") or _is_direct_server_running():
+        return
+    if _scan_ready():
+        try:
+            _start_direct_server()
+        except ValueError as exc:
+            if _store:
+                _store.add_activity("direct-server", "failed", str(exc))
+        return
+    if _autostart_thread and _autostart_thread.is_alive():
+        return
+    if _store:
+        _store.add_activity("direct-server", "waiting", "Autostart waiting for library scan to finish")
+    _autostart_thread = threading.Thread(target=_autostart_after_scan, name="remote-library-autostart", daemon=True)
+    _autostart_thread.start()
+
+
 def _server_status() -> dict:
     return {
         "running": _is_direct_server_running(),
+        "waitingForScan": bool(_settings().get("enabled") and not _is_direct_server_running() and not _scan_ready()),
         "host": _bind_host(),
         "port": _bind_port(),
         "url": _direct_url(),
-        "publicUrl": _public_url(),
         "protocol": "slopsmith-direct-library.v1",
     }
 
 
 def setup(app, context):
-    global _store, _get_dlc_dir, _extract_meta, _meta_db
+    global _store, _get_dlc_dir, _library_providers, _get_scan_status
     _store = RemoteLibraryServerStore(Path(context["config_dir"]))
     _get_dlc_dir = context.get("get_dlc_dir")
-    _extract_meta = context.get("extract_meta")
-    _meta_db = context.get("meta_db")
+    _library_providers = context.get("library_providers")
+    _get_scan_status = context.get("get_scan_status")
     if _settings().get("enabled"):
-        try:
-            _start_direct_server()
-        except ValueError as exc:
-            _store.add_activity("direct-server", "failed", str(exc))
+        _schedule_autostart_after_scan()
 
     @app.get("/api/plugins/remote_library_server/settings")
     def get_settings():
@@ -430,9 +636,15 @@ def setup(app, context):
 
     @app.post("/api/plugins/remote_library_server/settings")
     def save_settings(data: dict):
-        settings = _store.save_settings(data)
+        settings = _store.save_settings(_normalize_settings(data))
         try:
-            server = _restart_direct_server() if settings.get("enabled") else _stop_direct_server()
+            if not settings.get("enabled"):
+                server = _stop_direct_server()
+            elif _is_direct_server_running():
+                server = _restart_direct_server()
+            else:
+                _schedule_autostart_after_scan()
+                server = _server_status()
         except ValueError as exc:
             _store.add_activity("direct-server", "failed", str(exc))
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -441,21 +653,25 @@ def setup(app, context):
     @app.get("/api/plugins/remote_library_server/status")
     def status():
         root = _local_library_root()
-        songs = _local_song_summaries()
         return {
             "source": {
                 "sourceId": _source_id(),
                 "sourceName": _source_name(),
-                "songCount": len(songs),
+                "songCount": _local_song_count(),
                 "libraryRootConfigured": bool(root),
             },
             "server": _server_status(),
             "settings": _settings(),
+            "scan": _scan_status(),
+            "defaults": {
+                "host": "127.0.0.1",
+                "port": 8765,
+                "sourceName": _default_source_name(),
+            },
         }
 
     @app.post("/api/plugins/remote_library_server/start")
     def start_server():
-        _store.save_settings({"enabled": True})
         try:
             return {"server": _start_direct_server(), "settings": _settings()}
         except ValueError as exc:
@@ -464,16 +680,11 @@ def setup(app, context):
 
     @app.post("/api/plugins/remote_library_server/stop")
     def stop_server():
-        _store.save_settings({"enabled": False})
         return {"server": _stop_direct_server(), "settings": _settings()}
 
     @app.get("/api/plugins/remote_library_server/local-songs")
     def local_songs(q: str = "", pageSize: int = Query(50, ge=1, le=500), cursor: str | None = None):
-        offset = max(0, int(cursor or 0))
-        matches = _search_songs(q)
-        page = matches[offset:offset + pageSize]
-        next_cursor = str(offset + pageSize) if offset + pageSize < len(matches) else None
-        return {"songs": page, "total": len(matches), "nextCursor": next_cursor}
+        return _query_page_payload(q=q, page_size=pageSize, cursor=cursor)
 
     @app.get("/api/plugins/remote_library_server/activity")
     def activity():

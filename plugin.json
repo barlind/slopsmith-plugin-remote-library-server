@@ -1,7 +1,7 @@
 {
   "id": "remote_library_server",
   "name": "Remote Library Server",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": false,
   "nav": { "label": "Remote Server", "screen": "remote-library-server" },
   "screen": "screen.html",

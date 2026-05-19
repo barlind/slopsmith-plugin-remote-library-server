@@ -43,6 +43,8 @@ class RemoteSongSummary:
     artwork_thumb_hash: str | None = None
     arrangements: list[dict] = field(default_factory=list)
     has_lyrics: bool = False
+    stem_count: int = 0
+    stem_ids: list[str] = field(default_factory=list)
     tuning: str = ""
     capabilities: list[str] = field(default_factory=list)
     sync_support: SyncSupport = SyncSupport.NOT_SYNCABLE
@@ -65,6 +67,8 @@ class RemoteSongSummary:
             "artworkThumbHash": self.artwork_thumb_hash,
             "arrangements": self.arrangements,
             "has_lyrics": self.has_lyrics,
+            "stem_count": self.stem_count,
+            "stem_ids": self.stem_ids,
             "tuning": self.tuning,
             "capabilities": self.capabilities,
             "syncSupport": self.sync_support.value,

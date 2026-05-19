@@ -1,61 +1,46 @@
-<div id="remote-library-server-root" class="space-y-5">
-  <section class="rounded-lg border border-gray-800 bg-dark-900/60 p-4">
-    <div class="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
-      <div>
-        <h2 class="text-lg font-semibold text-white">Remote Library Server</h2>
+<div id="remote-library-server-root" class="mx-auto max-w-3xl px-6 pt-24 pb-16">
+  <button onclick="showScreen('home')" class="mb-6 flex items-center gap-1 text-sm text-gray-500 hover:text-white">
+    <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg>
+    Back
+  </button>
+
+  <section class="space-y-4">
+    <div class="flex items-center justify-between gap-3">
+      <div class="min-w-0">
+        <h2 class="text-3xl font-bold text-white">Remote Library Server</h2>
+        <div id="remote-library-server-message" class="mt-2 min-h-5 text-sm text-gray-400"></div>
         <p id="remote-library-server-subtitle" class="mt-1 text-sm text-gray-400"></p>
       </div>
-      <div class="flex flex-wrap gap-2">
-        <button class="rounded-lg bg-dark-700 px-3 py-2 text-sm text-gray-200 hover:bg-dark-600" data-rls-refresh>Refresh</button>
-        <button class="rounded-lg bg-accent px-3 py-2 text-sm font-semibold text-white hover:bg-accent-light" data-rls-start>Start</button>
-        <button class="rounded-lg bg-dark-700 px-3 py-2 text-sm text-gray-200 hover:bg-dark-600" data-rls-stop>Stop</button>
+      <div class="flex flex-shrink-0 items-center gap-2">
+        <button class="rounded-lg bg-dark-600 px-3 py-2 text-sm text-gray-300 transition hover:bg-dark-500 hover:text-white" data-rls-refresh>Refresh</button>
       </div>
     </div>
-    <div id="remote-library-server-status" class="mt-4 grid gap-3 md:grid-cols-3"></div>
-    <div id="remote-library-server-message" class="mt-3 text-sm text-gray-400"></div>
-  </section>
 
-  <section class="grid gap-4 lg:grid-cols-[minmax(0,0.85fr)_minmax(0,1fr)]">
-    <div class="rounded-lg border border-gray-800 bg-dark-900/60 p-4">
+    <div id="remote-library-server-status" class="mt-4"></div>
+
+    <div class="rounded-lg border border-gray-800/50 bg-dark-700/50 p-4">
       <div class="mb-3 flex items-center justify-between gap-3">
-        <h3 class="text-base font-semibold text-white">Server Settings</h3>
-        <button class="rounded-lg bg-dark-700 px-3 py-2 text-sm text-gray-200 hover:bg-dark-600" data-rls-save>Save</button>
+        <h3 class="text-base font-semibold text-white">Settings</h3>
+        <button class="rounded-lg bg-dark-600 px-3 py-2 text-sm text-gray-300 transition hover:bg-dark-500 hover:text-white" data-rls-save>Save</button>
       </div>
       <div class="grid gap-3 md:grid-cols-2">
         <label class="flex items-center gap-2 text-sm text-gray-300 md:col-span-2">
           <input id="rls-enabled" type="checkbox" class="h-4 w-4 rounded border-gray-700 bg-dark-800" />
-          Enabled
-        </label>
-        <label class="space-y-1 text-sm text-gray-300">
-          <span class="block text-xs uppercase text-gray-500">Host</span>
-          <input id="rls-host" type="text" class="w-full rounded-lg border border-gray-800 bg-dark-950 px-3 py-2 text-gray-100" />
-        </label>
-        <label class="space-y-1 text-sm text-gray-300">
-          <span class="block text-xs uppercase text-gray-500">Port</span>
-          <input id="rls-port" type="number" min="1" max="65535" class="w-full rounded-lg border border-gray-800 bg-dark-950 px-3 py-2 text-gray-100" />
+          Autostart
         </label>
         <label class="space-y-1 text-sm text-gray-300 md:col-span-2">
           <span class="block text-xs uppercase text-gray-500">Source Name</span>
-          <input id="rls-source-name" type="text" class="w-full rounded-lg border border-gray-800 bg-dark-950 px-3 py-2 text-gray-100" />
+          <input id="rls-source-name" type="text" class="w-full rounded-lg border border-gray-800 bg-dark-950 px-3 py-2 text-gray-100" style="background:#0f172a;color:#f8fafc;" />
         </label>
-        <label class="space-y-1 text-sm text-gray-300 md:col-span-2">
-          <span class="block text-xs uppercase text-gray-500">Public URL</span>
-          <input id="rls-public-url" type="url" class="w-full rounded-lg border border-gray-800 bg-dark-950 px-3 py-2 text-gray-100" placeholder="https://example.ngrok-free.app" />
+        <label class="space-y-1 text-sm text-gray-300">
+          <span class="block text-xs uppercase text-gray-500">Host</span>
+          <input id="rls-host" type="text" class="w-full rounded-lg border border-gray-800 bg-dark-950 px-3 py-2 text-gray-100" style="background:#0f172a;color:#f8fafc;" />
+        </label>
+        <label class="space-y-1 text-sm text-gray-300">
+          <span class="block text-xs uppercase text-gray-500">Port</span>
+          <input id="rls-port" type="number" min="1" max="65535" class="w-full rounded-lg border border-gray-800 bg-dark-950 px-3 py-2 text-gray-100" style="background:#0f172a;color:#f8fafc;" />
         </label>
       </div>
     </div>
-
-    <div class="rounded-lg border border-gray-800 bg-dark-900/60 p-4">
-      <div class="mb-3 flex items-center justify-between gap-3">
-        <h3 class="text-base font-semibold text-white">Songs</h3>
-        <input id="rls-search" type="search" class="w-56 rounded-lg border border-gray-800 bg-dark-950 px-3 py-2 text-sm text-gray-100" placeholder="Search" />
-      </div>
-      <div id="remote-library-server-songs" class="space-y-2"></div>
-    </div>
-  </section>
-
-  <section class="rounded-lg border border-gray-800 bg-dark-900/60 p-4">
-    <h3 class="text-base font-semibold text-white">Activity</h3>
-    <div id="remote-library-server-activity" class="mt-3 space-y-2"></div>
   </section>
 </div>

@@ -6,14 +6,15 @@ from threading import RLock
 
 from .models import utc_now_iso
 
+_SETTINGS_KEYS = ("enabled", "host", "port", "sourceName")
+
 
 def _default_settings() -> dict:
     return {
         "enabled": False,
-        "host": "127.0.0.1",
-        "port": 8765,
+        "host": "",
+        "port": "",
         "sourceName": "",
-        "publicUrl": "",
     }
 
 
@@ -34,11 +35,11 @@ class RemoteLibraryServerStore:
                     settings.update(loaded)
             except json.JSONDecodeError:
                 pass
-        return settings
+        return {key: settings.get(key) for key in _SETTINGS_KEYS}
 
     def save_settings(self, data: dict) -> dict:
         settings = self.load_settings()
-        settings.update({key: value for key, value in data.items() if value is not None})
+        settings.update({key: value for key, value in data.items() if value is not None and key in _SETTINGS_KEYS})
         with self._lock:
             self.settings_path.write_text(json.dumps(settings, indent=2, sort_keys=True))
         return settings
