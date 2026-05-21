@@ -25,6 +25,7 @@ _direct_server = None
 _direct_thread: threading.Thread | None = None
 _autostart_thread: threading.Thread | None = None
 _get_scan_status = None
+_shutdown_requested = threading.Event()
 
 
 def _settings() -> dict:
@@ -581,8 +582,9 @@ def _restart_direct_server() -> dict:
 
 def _autostart_after_scan() -> None:
     while _settings().get("enabled") and not _scan_ready():
-        time.sleep(1)
-    if not _settings().get("enabled") or _is_direct_server_running():
+        if _shutdown_requested.wait(timeout=1):
+            return
+    if _shutdown_requested.is_set() or not _settings().get("enabled") or _is_direct_server_running():
         return
     try:
         _start_direct_server()
@@ -593,6 +595,8 @@ def _autostart_after_scan() -> None:
 
 def _schedule_autostart_after_scan() -> None:
     global _autostart_thread
+    if _shutdown_requested.is_set():
+        return
     if not _settings().get("enabled") or _is_direct_server_running():
         return
     if _scan_ready():
@@ -610,6 +614,11 @@ def _schedule_autostart_after_scan() -> None:
     _autostart_thread.start()
 
 
+def _shutdown() -> None:
+    _shutdown_requested.set()
+    _stop_direct_server()
+
+
 def _server_status() -> dict:
     return {
         "running": _is_direct_server_running(),
@@ -623,10 +632,12 @@ def _server_status() -> dict:
 
 def setup(app, context):
     global _store, _get_dlc_dir, _library_providers, _get_scan_status
+    _shutdown_requested.clear()
     _store = RemoteLibraryServerStore(Path(context["config_dir"]))
     _get_dlc_dir = context.get("get_dlc_dir")
     _library_providers = context.get("library_providers")
     _get_scan_status = context.get("get_scan_status")
+    app.router.on_shutdown.append(_shutdown)
     if _settings().get("enabled"):
         _schedule_autostart_after_scan()
 

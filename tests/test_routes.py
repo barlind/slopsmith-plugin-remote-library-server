@@ -118,6 +118,26 @@ def test_management_status_uses_direct_server_shape(tmp_path):
     assert management_client.get("/api/plugins/remote_library_server/pairing/requests").status_code == 404
 
 
+def test_shutdown_stops_direct_server(tmp_path, monkeypatch):
+    routes = importlib.import_module("routes")
+    routes = importlib.reload(routes)
+    stopped = []
+
+    monkeypatch.setattr(routes, "_stop_direct_server", lambda: stopped.append(True) or {})
+
+    app = FastAPI()
+    routes.setup(app, {
+        "config_dir": tmp_path / "config",
+        "get_dlc_dir": lambda: tmp_path / "dlc",
+        "library_providers": FakeLibraryProviders(FakeLocalProvider("song.sloppak")),
+        "get_scan_status": lambda: {"running": False, "stage": "complete"},
+    })
+
+    assert routes._shutdown in app.router.on_shutdown
+    routes._shutdown()
+    assert stopped == [True]
+
+
 def test_direct_source_and_song_search_do_not_expose_paths(tmp_path):
     _management_client, direct_client, package_path = _client(tmp_path)
 
