@@ -8,13 +8,18 @@
   "settings": { "html": "settings.html" },
   "script": "screen.js",
   "routes": "routes.py",
-  "standards": ["plugin-runtime-idempotent.v1"],
+  "standards": ["capability-pipelines.v1", "plugin-runtime-idempotent.v1"],
   "capabilities": {
-    "remote-library-server": {
-      "roles": ["source"],
-      "commands": ["start", "stop", "list-songs", "serve-art", "download-package"],
-      "events": ["remote-library-server.activity"],
-      "mode": "optional"
+    "library": {
+      "roles": ["requester", "observer"],
+      "requests": ["list-providers", "get-current", "inspect"],
+      "observes": ["providers-refreshed", "source-changed"],
+      "description": "Wraps Slopsmith's local library source for direct remote-library clients.",
+      "mode": "active",
+      "compatibility": "none",
+      "ownership": "requester-only",
+      "safety": "safe",
+      "version": 1
     }
   }
 }

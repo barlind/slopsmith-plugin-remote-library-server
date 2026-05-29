@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import importlib
+import hashlib
+import json
+import sqlite3
 import sys
 import zipfile
 from pathlib import Path
@@ -103,6 +106,66 @@ def _client(tmp_path, package_name="song.sloppak", package_content: bytes | None
     return management_client, direct_client, package_path
 
 
+def _enable_nam_tone_sharing(management_client):
+    response = management_client.post("/api/plugins/remote_library_server/settings", json={
+        "enabled": False,
+        "host": "127.0.0.1",
+        "port": 9876,
+        "sourceName": "Studio Source",
+        "shareNamToneAssets": True,
+    })
+    assert response.status_code == 200
+
+
+def _write_nam_tone_fixture(config_dir: Path, filename: str = "song.psarc") -> dict:
+    config_dir.mkdir(parents=True, exist_ok=True)
+    models_dir = config_dir / "nam_models"
+    irs_dir = config_dir / "nam_irs"
+    models_dir.mkdir()
+    irs_dir.mkdir()
+    model_bytes = b'{"version": "test model"}'
+    ir_bytes = b"RIFF-test-ir"
+    (models_dir / "clean.nam").write_bytes(model_bytes)
+    (irs_dir / "room.wav").write_bytes(ir_bytes)
+    conn = sqlite3.connect(config_dir / "nam_tone.db")
+    conn.executescript("""
+        CREATE TABLE presets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            model_file TEXT,
+            ir_file TEXT,
+            input_gain REAL NOT NULL DEFAULT 1.0,
+            output_gain REAL NOT NULL DEFAULT 0.5,
+            gate_threshold REAL NOT NULL DEFAULT -60.0,
+            settings_json TEXT NOT NULL DEFAULT '{}'
+        );
+        CREATE TABLE tone_mappings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            filename TEXT NOT NULL,
+            tone_key TEXT NOT NULL,
+            preset_id INTEGER NOT NULL,
+            UNIQUE(filename, tone_key),
+            FOREIGN KEY (preset_id) REFERENCES presets(id)
+        );
+    """)
+    conn.execute(
+        "INSERT INTO presets (name, model_file, ir_file, input_gain, output_gain, gate_threshold, settings_json) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("Clean NAM", "clean.nam", "room.wav", 1.25, 0.75, -55.0, json.dumps({"cab": "open"})),
+    )
+    preset_id = conn.execute("SELECT id FROM presets WHERE name = ?", ("Clean NAM",)).fetchone()[0]
+    conn.execute(
+        "INSERT INTO tone_mappings (filename, tone_key, preset_id) VALUES (?, ?, ?)",
+        (filename, "Clean", preset_id),
+    )
+    conn.commit()
+    conn.close()
+    return {
+        "modelSha": "sha256:" + hashlib.sha256(model_bytes).hexdigest(),
+        "irSha": "sha256:" + hashlib.sha256(ir_bytes).hexdigest(),
+    }
+
+
 def test_management_status_uses_direct_server_shape(tmp_path):
     management_client, _direct_client, _package_path = _client(tmp_path)
 
@@ -172,6 +235,69 @@ def test_direct_songs_use_local_provider_paged_query_without_package_hashing(tmp
     assert song["title"] == "Clean Tone"
     assert song["remoteSongId"].startswith("song_")
     assert "packageHash" not in song
+
+
+def test_nam_tone_sync_is_disabled_by_default(tmp_path):
+    _management_client, direct_client, _package_path = _client(
+        tmp_path, package_name="song.psarc", package_content=b"small-package"
+    )
+    song = direct_client.get("/songs").json()["songs"][0]
+
+    response = direct_client.get(f"/songs/{song['remoteSongId']}/nam-tone-sync")
+
+    assert response.status_code == 403
+    assert "disabled" in response.json()["detail"]
+
+
+def test_nam_tone_sync_exports_song_mappings_and_referenced_assets(tmp_path):
+    management_client, direct_client, _package_path = _client(
+        tmp_path, package_name="song.psarc", package_content=b"small-package"
+    )
+    expected = _write_nam_tone_fixture(tmp_path / "config", "song.psarc")
+    _enable_nam_tone_sharing(management_client)
+    song = direct_client.get("/songs").json()["songs"][0]
+
+    response = direct_client.get(f"/songs/{song['remoteSongId']}/nam-tone-sync")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["schema"] == "slopsmith.nam-tone-sync.v1"
+    assert data["sourceFilename"] == "song.psarc"
+    assert data["mappings"] == [{"toneKey": "Clean", "presetRef": "preset:1"}]
+    preset = data["presets"][0]
+    assert preset["name"] == "Clean NAM"
+    assert preset["inputGain"] == 1.25
+    assert preset["outputGain"] == 0.75
+    assert preset["gateThreshold"] == -55.0
+    assert preset["settings"] == {"cab": "open"}
+    assert preset["modelFile"]["name"] == "clean.nam"
+    assert preset["modelFile"]["sha256"] == expected["modelSha"]
+    assert preset["irFile"]["name"] == "room.wav"
+    assert preset["irFile"]["sha256"] == expected["irSha"]
+
+    model = direct_client.get(preset["modelFile"]["url"])
+    ir = direct_client.get(preset["irFile"]["url"])
+
+    assert model.status_code == 200
+    assert model.content == b'{"version": "test model"}'
+    assert model.headers["content-type"].startswith("application/json")
+    assert ir.status_code == 200
+    assert ir.content == b"RIFF-test-ir"
+    assert ir.headers["content-type"].startswith("audio/wav")
+
+
+def test_nam_tone_asset_endpoint_only_serves_referenced_song_assets(tmp_path):
+    management_client, direct_client, _package_path = _client(
+        tmp_path, package_name="song.psarc", package_content=b"small-package"
+    )
+    _write_nam_tone_fixture(tmp_path / "config", "song.psarc")
+    (tmp_path / "config" / "nam_models" / "other.nam").write_bytes(b"other")
+    _enable_nam_tone_sharing(management_client)
+    song = direct_client.get("/songs").json()["songs"][0]
+
+    response = direct_client.get(f"/songs/{song['remoteSongId']}/nam-tone-assets/model/other.nam")
+
+    assert response.status_code == 404
 
 
 def test_direct_package_download_returns_original_file(tmp_path):

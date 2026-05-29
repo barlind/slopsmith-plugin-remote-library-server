@@ -62,6 +62,7 @@
     function setForm(settings) {
         const values = {
             'rls-enabled': Boolean(settings.enabled),
+            'rls-share-nam-tone-assets': Boolean(settings.shareNamToneAssets),
             'rls-source-name': settings.sourceName || '',
             'rls-host': settings.host || '',
             'rls-port': settings.port || '',
@@ -83,6 +84,7 @@
     function readForm() {
         return {
             enabled: Boolean(document.getElementById('rls-enabled')?.checked),
+            shareNamToneAssets: Boolean(document.getElementById('rls-share-nam-tone-assets')?.checked),
             sourceName: document.getElementById('rls-source-name')?.value.trim() || defaultValue('sourceName'),
             host: document.getElementById('rls-host')?.value.trim() || defaultValue('host'),
             port: Number(document.getElementById('rls-port')?.value || defaultValue('port')),

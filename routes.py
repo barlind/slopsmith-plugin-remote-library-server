@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import inspect
+import json
 import os
 import re
+import sqlite3
 import socket
 import threading
 import time
 from pathlib import Path
 from typing import Any
+from urllib import parse
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,7 +29,9 @@ _direct_server = None
 _direct_thread: threading.Thread | None = None
 _autostart_thread: threading.Thread | None = None
 _get_scan_status = None
+_config_dir: Path | None = None
 _shutdown_requested = threading.Event()
+NAM_TONE_SYNC_SCHEMA = "slopsmith.nam-tone-sync.v1"
 
 
 def _settings() -> dict:
@@ -80,6 +86,9 @@ def _normalize_settings(data: dict) -> dict:
         normalized["port"] = max(1, min(65535, int(incoming.get("port", current.get("port")) or 8765)))
     except (TypeError, ValueError):
         normalized["port"] = 8765
+    normalized["shareNamToneAssets"] = bool(
+        incoming.get("shareNamToneAssets", current.get("shareNamToneAssets", False))
+    )
     return normalized
 
 
@@ -239,6 +248,9 @@ def _remote_summary_from_local_song(song: dict) -> dict:
     syncable = package_form in {PackageForm.PSARC_FILE, PackageForm.SLOPPAK_ZIP}
     remote_song_id = _remote_song_id_for_relative(relative_name)
     identity = f"{_source_id()}:{relative_name}".encode("utf-8")
+    capabilities = ["artwork", "package-download"] if syncable else ["artwork"]
+    if _nam_tone_sharing_enabled():
+        capabilities.append("nam-tone-sync")
     summary = RemoteSongSummary(
         source_id=_source_id(),
         remote_song_id=remote_song_id,
@@ -258,7 +270,7 @@ def _remote_summary_from_local_song(song: dict) -> dict:
         stem_count=_coerce_int(song.get("stem_count", song.get("stemCount"))) or 0,
         stem_ids=list(song.get("stem_ids") or song.get("stemIds") or []),
         tuning=song.get("tuning") or song.get("tuning_name") or song.get("tuningName") or "",
-        capabilities=["artwork", "package-download"] if syncable else ["artwork"],
+        capabilities=capabilities,
         sync_support=SyncSupport.SYNCABLE if syncable else SyncSupport.NOT_SYNCABLE,
         status=RemoteSongStatus.REMOTE_ONLY if syncable else RemoteSongStatus.NOT_SYNCABLE,
     ).to_dict()
@@ -266,7 +278,168 @@ def _remote_summary_from_local_song(song: dict) -> dict:
     summary["artworkUrl"] = f"/songs/{remote_song_id}/art"
     if syncable:
         summary["packageUrl"] = f"/songs/{remote_song_id}/package"
+    if _nam_tone_sharing_enabled():
+        summary["namToneSyncUrl"] = f"/songs/{remote_song_id}/nam-tone-sync"
     return summary
+
+
+def _config_root() -> Path:
+    if _config_dir is not None:
+        return _config_dir
+    if _store is not None:
+        return _store.root.parent
+    return Path(os.environ.get("CONFIG_DIR") or ".")
+
+
+def _nam_tone_sharing_enabled() -> bool:
+    return bool(_settings().get("shareNamToneAssets"))
+
+
+def _nam_db_path() -> Path:
+    return _config_root() / "nam_tone.db"
+
+
+def _nam_models_dir() -> Path:
+    return _config_root() / "nam_models"
+
+
+def _nam_irs_dir() -> Path:
+    return _config_root() / "nam_irs"
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return f"sha256:{digest.hexdigest()}"
+
+
+def _safe_child(root: Path, name: str | None) -> Path | None:
+    if not name:
+        return None
+    root_resolved = root.resolve()
+    path = (root / name).resolve()
+    try:
+        path.relative_to(root_resolved)
+    except ValueError:
+        return None
+    return path
+
+
+def _nam_mapping_filenames(filename: str) -> list[str]:
+    names = [filename]
+    normalized = filename.replace("\\", "/")
+    if normalized.startswith("sloppak/") and normalized.lower().endswith(".sloppak"):
+        psarc_name = f"{Path(normalized).stem}_p.psarc"
+        if psarc_name not in names:
+            names.append(psarc_name)
+    return names
+
+
+def _empty_nam_tone_sync_payload(relative_name: str, song_id: str, warnings: list[str] | None = None) -> dict:
+    return {
+        "schema": NAM_TONE_SYNC_SCHEMA,
+        "sourceId": _source_id(),
+        "remoteSongId": song_id,
+        "sourceFilename": relative_name,
+        "mappings": [],
+        "presets": [],
+        "warnings": warnings or [],
+    }
+
+
+def _nam_asset_metadata(asset_type: str, name: str | None, song_id: str, warnings: list[str]) -> dict | None:
+    if not name:
+        return None
+    root = _nam_models_dir() if asset_type == "model" else _nam_irs_dir()
+    path = _safe_child(root, name)
+    if path is None:
+        warnings.append(f"Preset references an invalid {asset_type} file path: {name}")
+        return None
+    if not path.exists() or not path.is_file():
+        warnings.append(f"Preset references a missing {asset_type} file: {name}")
+        return None
+    stat = path.stat()
+    return {
+        "type": asset_type,
+        "name": name,
+        "sizeBytes": stat.st_size,
+        "sha256": _sha256_file(path),
+        "url": f"/songs/{parse.quote(song_id, safe='')}/nam-tone-assets/{asset_type}/{parse.quote(name, safe='')}",
+    }
+
+
+def _nam_tone_sync_payload(relative_name: str, song_id: str) -> dict:
+    if not _nam_tone_sharing_enabled():
+        raise HTTPException(status_code=403, detail="NAM tone asset sharing is disabled")
+    db_path = _nam_db_path()
+    if not db_path.exists():
+        return _empty_nam_tone_sync_payload(relative_name, song_id)
+    filenames = _nam_mapping_filenames(relative_name)
+    placeholders = ",".join("?" for _ in filenames)
+    try:
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+            rows = conn.execute(
+                "SELECT tm.tone_key, p.id, p.name, p.model_file, p.ir_file, "
+                "p.input_gain, p.output_gain, p.gate_threshold, p.settings_json "
+                "FROM tone_mappings tm JOIN presets p ON tm.preset_id = p.id "
+                f"WHERE tm.filename IN ({placeholders}) "
+                "ORDER BY CASE tm.filename WHEN ? THEN 0 ELSE 1 END, tm.tone_key",
+                (*filenames, relative_name),
+            ).fetchall()
+    except sqlite3.Error as exc:
+        raise HTTPException(status_code=500, detail="NAM tone database is unavailable") from exc
+
+    warnings: list[str] = []
+    mappings: list[dict] = []
+    presets_by_ref: dict[str, dict] = {}
+    seen_tones: set[str] = set()
+    for row in rows:
+        tone_key = str(row[0] or "")
+        if not tone_key or tone_key in seen_tones:
+            continue
+        seen_tones.add(tone_key)
+        preset_ref = f"preset:{row[1]}"
+        mappings.append({"toneKey": tone_key, "presetRef": preset_ref})
+        if preset_ref in presets_by_ref:
+            continue
+        settings = {}
+        try:
+            settings = json.loads(row[8] or "{}")
+            if not isinstance(settings, dict):
+                settings = {}
+        except json.JSONDecodeError:
+            warnings.append(f"Preset {row[2] or row[1]} has invalid settings JSON")
+        presets_by_ref[preset_ref] = {
+            "ref": preset_ref,
+            "name": str(row[2] or ""),
+            "modelFile": _nam_asset_metadata("model", row[3], song_id, warnings),
+            "irFile": _nam_asset_metadata("ir", row[4], song_id, warnings),
+            "inputGain": float(row[5] if row[5] is not None else 1.0),
+            "outputGain": float(row[6] if row[6] is not None else 0.5),
+            "gateThreshold": float(row[7] if row[7] is not None else -60.0),
+            "settings": settings,
+        }
+
+    return {
+        **_empty_nam_tone_sync_payload(relative_name, song_id, warnings),
+        "mappings": mappings,
+        "presets": list(presets_by_ref.values()),
+    }
+
+
+def _nam_tone_asset_path(asset_type: str, name: str) -> Path | None:
+    if asset_type == "model":
+        return _safe_child(_nam_models_dir(), name)
+    if asset_type == "ir":
+        return _safe_child(_nam_irs_dir(), name)
+    return None
+
+
+def _nam_tone_asset_referenced(payload: dict, asset_type: str, name: str) -> bool:
+    field = "modelFile" if asset_type == "model" else "irFile"
+    return any((preset.get(field) or {}).get("name") == name for preset in payload.get("presets") or [])
 
 
 def _remote_artists_from_local_artists(artists: list[dict]) -> list[dict]:
@@ -326,11 +499,16 @@ def _library_art_response(result: Any) -> Response:
 
 
 def _source_payload() -> dict:
+    capabilities = ["library.read", "art.read", "song.sync"]
+    if _nam_tone_sharing_enabled():
+        capabilities.append("nam-tone-sync.read")
     return {
         "ok": True,
         "sourceId": _source_id(),
         "sourceName": _source_name(),
         "songCount": _local_song_count(),
+        "capabilities": capabilities,
+        "namToneSync": {"enabled": _nam_tone_sharing_enabled()},
         "server": {
             "url": _direct_url(),
             "protocol": "slopsmith-direct-library.v1",
@@ -528,6 +706,27 @@ def _create_direct_app() -> FastAPI:
             headers={"X-Slopsmith-Remote-Song-Id": song_id},
         )
 
+    @direct_app.get("/songs/{song_id}/nam-tone-sync")
+    def song_nam_tone_sync(song_id: str) -> dict:
+        relative_name = _relative_for_remote_song_id(song_id)
+        if not relative_name or not _package_path_for_relative(relative_name):
+            raise HTTPException(status_code=404, detail="song not found")
+        return _nam_tone_sync_payload(relative_name, song_id)
+
+    @direct_app.get("/songs/{song_id}/nam-tone-assets/{asset_type}/{name:path}")
+    def song_nam_tone_asset(song_id: str, asset_type: str, name: str) -> FileResponse:
+        if asset_type not in {"model", "ir"}:
+            raise HTTPException(status_code=404, detail="asset not found")
+        relative_name = _relative_for_remote_song_id(song_id)
+        if not relative_name or not _package_path_for_relative(relative_name):
+            raise HTTPException(status_code=404, detail="song not found")
+        payload = _nam_tone_sync_payload(relative_name, song_id)
+        path = _nam_tone_asset_path(asset_type, name)
+        if path is None or not path.exists() or not path.is_file() or not _nam_tone_asset_referenced(payload, asset_type, name):
+            raise HTTPException(status_code=404, detail="asset not found")
+        media_type = "application/json" if asset_type == "model" else "audio/wav"
+        return FileResponse(str(path), media_type=media_type, filename=path.name)
+
     return direct_app
 
 
@@ -631,9 +830,10 @@ def _server_status() -> dict:
 
 
 def setup(app, context):
-    global _store, _get_dlc_dir, _library_providers, _get_scan_status
+    global _store, _get_dlc_dir, _library_providers, _get_scan_status, _config_dir
     _shutdown_requested.clear()
-    _store = RemoteLibraryServerStore(Path(context["config_dir"]))
+    _config_dir = Path(context["config_dir"])
+    _store = RemoteLibraryServerStore(_config_dir)
     _get_dlc_dir = context.get("get_dlc_dir")
     _library_providers = context.get("library_providers")
     _get_scan_status = context.get("get_scan_status")

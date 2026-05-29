@@ -6,7 +6,7 @@ from threading import RLock
 
 from .models import utc_now_iso
 
-_SETTINGS_KEYS = ("enabled", "host", "port", "sourceName")
+_SETTINGS_KEYS = ("enabled", "host", "port", "sourceName", "shareNamToneAssets")
 
 
 def _default_settings() -> dict:
@@ -15,6 +15,7 @@ def _default_settings() -> dict:
         "host": "",
         "port": "",
         "sourceName": "",
+        "shareNamToneAssets": False,
     }
 
 

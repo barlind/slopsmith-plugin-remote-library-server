@@ -4,6 +4,12 @@ Remote Library Server is a source-side Slopsmith plugin for sharing the current 
 
 The direct server is a thin wrapper around Slopsmith's `local` library provider. It does not build or publish a second catalog of its own; the songs, filters, sort order, artwork, and package downloads reflect what the local Slopsmith library provider exposes.
 
+## Runtime Model
+
+The plugin declares the core `library` capability as a requester/observer. Its manifest uses `requests` for public library owner commands (`list-providers`, `get-current`, `inspect`) and `observes` for source lifecycle events (`providers-refreshed`, `source-changed`). It uses Slopsmith's existing `local` provider through the library provider registry, but it does not own the `library` domain and does not register itself as a `library` provider. The Remote Library Client is the plugin that should appear as a `library` provider when it registers a remote source.
+
+Management stays on the plugin's existing screen and backend routes rather than capability commands. The capability declaration exists so diagnostics and the bundled Capability Inspector show that this server depends on the library surface it wraps.
+
 ## What It Does
 
 - Starts a direct library server on a configurable host and port.
@@ -12,6 +18,7 @@ The direct server is a thin wrapper around Slopsmith's `local` library provider.
 - Supports the same core library search/filter/sort parameters used by the client library UI.
 - Serves artwork through Slopsmith's local provider.
 - Serves original package files for remote load/play.
+- Optionally shares per-song NAM tone preset mappings, referenced `.nam` models, and IR `.wav` files.
 - Exposes artist tree, stats, and tuning-name helper endpoints for the remote Library UI.
 - Allows a client plugin to connect by base URL.
 
@@ -41,6 +48,8 @@ When the server is running, the client only needs the server base URL, for examp
 - `GET /tuning-names`
 - `GET /songs/{remoteSongId}/art`
 - `GET /songs/{remoteSongId}/package`
+- `GET /songs/{remoteSongId}/nam-tone-sync`
+- `GET /songs/{remoteSongId}/nam-tone-assets/{model|ir}/{name}`
 
 `/songs` also accepts the legacy cursor form (`cursor=0`) for clients that page by offset. Search/filter parameters include `format`, `arrangements_has`, `arrangements_lacks`, `stems_has`, `stems_lacks`, `has_lyrics`, and `tunings`.
 
@@ -60,6 +69,7 @@ The plugin also exposes management endpoints on Slopsmith's main backend:
 - `host`: bind host. Use `127.0.0.1` for same-machine access or `0.0.0.0` for LAN access.
 - `port`: bind port. Default: `8765`.
 - `sourceName`: display name returned by `/source`.
+- `shareNamToneAssets`: allows the direct server to expose NAM Tone Engine preset mappings and referenced model/IR assets for synced songs. Default: `false`.
 
 If `enabled` is true during Slopsmith startup, the plugin reports `waitingForScan` and starts the direct server after the local library scan reaches `complete`.
 
@@ -67,6 +77,7 @@ If `enabled` is true during Slopsmith startup, the plugin reports `waitingForSca
 
 - Remote song IDs are URL-safe encoded references to local library-relative filenames.
 - Package downloads are resolved back under the configured Slopsmith DLC/library root and path-checked before serving.
+- NAM tone asset sharing is off by default. When enabled, the server reads `nam_tone.db`, `nam_models/`, and `nam_irs/` directly from the Slopsmith config directory and only serves model/IR files referenced by the requested song's exported tone manifest.
 - The direct server intentionally relies on Slopsmith's local provider instead of rescanning or hashing the library itself.
 - Artwork responses are cached by clients and served with a short public cache header.
 
